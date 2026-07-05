@@ -3,7 +3,8 @@ package raft
 import (
 	"sync"
 	"time"
-	 "math/rand"
+	"math/rand"
+	
 )
 
 type Node struct {
@@ -66,4 +67,11 @@ func NewNode(id string, address string, peers []string) *Node {
     }
 
     }
+
+
+func (n *Node) Start() {
+    fmt.Printf("Node %s starting on %s as %s\n", n.id, n.address, n.role)
+    
+    go n.runElectionTimer()
+    go n.startHTTPServer()
 }
