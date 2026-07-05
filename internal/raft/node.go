@@ -4,7 +4,9 @@ import (
 	"sync"
 	"time"
 	"math/rand"
-	
+	"fmt"
+	"net/http"
+
 )
 
 type Node struct {
@@ -74,4 +76,20 @@ func (n *Node) Start() {
     
     go n.runElectionTimer()
     go n.startHTTPServer()
+}
+func (n *Node) startHTTPServer() {
+    mux := http.NewServeMux()
+    mux.HandleFunc("/request-vote", n.handleRequestVote)
+    mux.HandleFunc("/append-entries", n.handleAppendEntries)
+    mux.HandleFunc("/client-request", n.handleClientRequest)
+
+    server := &http.Server{
+        Addr:    n.address,
+        Handler: mux,
+    }
+
+    fmt.Printf("Node %s listening on %s\n", n.id, n.address)
+    if err := server.ListenAndServe(); err != nil {
+        fmt.Printf("Node %s HTTP server error: %s\n", n.id, err)
+    }
 }
