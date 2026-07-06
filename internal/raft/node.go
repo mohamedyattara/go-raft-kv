@@ -58,8 +58,8 @@ func NewNode(id string, address string, peers []string) *Node {
 		currentTerm:      0,
 		votedFor:         "",
 		log:              []LogEntry{},
-		commitIndex:      0,
-		lastApplied:      0,
+		commitIndex:      -1,
+		lastApplied:      -1,
 		kvStore:          make(map[string]string),
 		nextIndex:        make(map[string]int),
 		matchIndex:       make(map[string]int),
@@ -163,7 +163,7 @@ func (n *Node) handleAppendEntries(w http.ResponseWriter, r *http.Request) {
 	}
 
 	n.role = "follower"
-
+	//fmt.Printf("Node %s received heartbeat from %s term %d\n", n.id, req.LeaderID, req.Term)
 	select {
 	case n.heartbeatCh <- true:
 	default:
@@ -176,6 +176,7 @@ func (n *Node) handleAppendEntries(w http.ResponseWriter, r *http.Request) {
 	if req.LeaderCommit > n.commitIndex {
 		n.commitIndex = req.LeaderCommit
 		n.applyEntries()
+		fmt.Printf("Node %s applied entries up to index %d\n", n.id, n.commitIndex)
 	}
 
 	resp.Success = true
@@ -186,9 +187,9 @@ func (n *Node) handleClientRequest(w http.ResponseWriter, r *http.Request) {
 	json.NewDecoder(r.Body).Decode(&req)
 
 	n.mu.Lock()
-	defer n.mu.Unlock()
 
 	if n.role != "leader" {
+		n.mu.Unlock()
 		json.NewEncoder(w).Encode(map[string]string{
 			"error":  "not_leader",
 			"leader": n.votedFor,
@@ -197,20 +198,97 @@ func (n *Node) handleClientRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	command := req["command"]
+	parts := strings.Split(command, " ")
+	if parts[0] == "GET" && len(parts) == 2 {
+		value, ok := n.kvStore[parts[1]]
+		n.mu.Unlock()
+		if !ok {
+			json.NewEncoder(w).Encode(map[string]string{
+				"error": "key not found",
+			})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]string{
+			"value": value,
+		})
+		return
+	}
 	entry := LogEntry{
 		Term:    n.currentTerm,
 		Command: command,
 	}
 	n.log = append(n.log, entry)
+	logIndex := len(n.log) - 1
+	term := n.currentTerm
+	n.mu.Unlock()
 
+	confirmed := 1
+	var mu sync.Mutex
+	confirmCh := make(chan bool, len(n.peers))
+
+	for _, peer := range n.peers {
+		go func(peer string) {
+			n.mu.Lock()
+			req := AppendEntriesRequest{
+				Term:         term,
+				LeaderID:     n.id,
+				Entries:      []LogEntry{entry},
+				LeaderCommit: n.commitIndex,
+			}
+			n.mu.Unlock()
+			resp, err := n.sendAppendEntries(peer, req)
+			if err != nil {
+				confirmCh <- false
+				return
+			}
+			if resp.Success {
+				n.mu.Lock()
+				n.matchIndex[peer] = logIndex
+				n.nextIndex[peer] = logIndex + 1
+				n.mu.Unlock()
+				confirmCh <- true
+			} else {
+				confirmCh <- false
+			}
+		}(peer)
+	}
+
+	for i := 0; i < len(n.peers); i++ {
+		if <-confirmCh {
+			mu.Lock()
+			confirmed++
+			mu.Unlock()
+		}
+	}
+	mu.Lock()
+	totalNodes := len(n.peers) + 1
+	majority := totalNodes/2 + 1
+	currentConfirmed := confirmed
+	mu.Unlock()
+
+	if currentConfirmed >= majority {
+		n.mu.Lock()
+		if logIndex > n.commitIndex {
+			n.commitIndex = logIndex
+			n.applyEntries()
+		}
+		n.mu.Unlock()
+
+		fmt.Printf("Node %s committed entry %d: %s\n", n.id, logIndex, command)
+		json.NewEncoder(w).Encode(map[string]string{
+			"status": "ok",
+		})
+		return
+	}
 	json.NewEncoder(w).Encode(map[string]string{
-		"status": "ok",
+		"error": "failed to replicate to majority",
 	})
 }
+
 func (n *Node) applyEntries() {
 	for n.lastApplied < n.commitIndex {
 		n.lastApplied++
-		entry := n.log[n.lastApplied-1]
+		entry := n.log[n.lastApplied]
 		parts := strings.Split(entry.Command, " ")
 
 		if len(parts) == 3 && parts[0] == "PUT" {
