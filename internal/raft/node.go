@@ -44,6 +44,14 @@ type Node struct {
 	electionTimeout  time.Duration
 	heartbeatTimeout time.Duration
 }
+type NodeStatus struct {
+	ID          string            `json:"id"`
+	Role        string            `json:"role"`
+	Term        int               `json:"term"`
+	CommitIndex int               `json:"commit_index"`
+	LogLength   int               `json:"log_length"`
+	KVStore     map[string]string `json:"kv_store"`
+}
 type LogEntry struct {
 	Term    int
 	Command string
@@ -83,7 +91,7 @@ func (n *Node) startHTTPServer() {
 	mux.HandleFunc("/request-vote", n.handleRequestVote)
 	mux.HandleFunc("/append-entries", n.handleAppendEntries)
 	mux.HandleFunc("/client-request", n.handleClientRequest)
-
+	mux.HandleFunc("/status", n.handleStatus)
 	server := &http.Server{
 		Addr:    n.address,
 		Handler: mux,
@@ -283,6 +291,22 @@ func (n *Node) handleClientRequest(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{
 		"error": "failed to replicate to majority",
 	})
+}
+
+func (n *Node) handleStatus(w http.ResponseWriter, r *http.Request) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	status := NodeStatus{
+		ID:          n.id,
+		Role:        n.role,
+		Term:        n.currentTerm,
+		CommitIndex: n.commitIndex,
+		LogLength:   len(n.log),
+		KVStore:     n.kvStore,
+	}
+
+	json.NewEncoder(w).Encode(status)
 }
 
 func (n *Node) applyEntries() {
