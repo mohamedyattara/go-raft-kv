@@ -5,29 +5,46 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"os/exec"
 	"testing"
 	"time"
 )
 
-func startNode(id string, address string, peers string) *exec.Cmd {
-	cmd := exec.Command("go", "run", "/cmd/node/main.go",
+var nodes = []string{
+	"localhost:8001",
+	"localhost:8002",
+	"localhost:8003",
+}
+
+func startNode(id, address, peers string) (*exec.Cmd, error) {
+	cmd := exec.Command(
+		"go", "run", "./cmd/node/main.go",
 		"--id="+id,
 		"--address="+address,
 		"--peers="+peers,
 	)
-	cmd.Start()
-	return cmd
+	cmd.Dir = "../"
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("failed to start %s: %w", id, err)
+	}
+
+	return cmd, nil
 }
 
 func killNode(cmd *exec.Cmd) {
-	if cmd != nil && cmd.Process != nil {
-		cmd.Process.Kill()
+	if cmd == nil || cmd.Process == nil {
+		return
 	}
+	_ = cmd.Process.Kill()
+	_, _ = cmd.Process.Wait()
+	time.Sleep(2 * time.Second)
 }
-func sendToLeader(command string) (map[string]string, error) {
-	nodes := []string{"localhost:8001", "localhost:8002", "localhost:8003"}
 
+func sendToLeader(command string) (map[string]string, error) {
 	for _, node := range nodes {
 		result, err := sendRequest(node, command)
 		if err != nil {
@@ -41,33 +58,93 @@ func sendToLeader(command string) (map[string]string, error) {
 	return nil, fmt.Errorf("no leader found")
 }
 
-func sendRequest(target string, command string) (map[string]string, error) {
-	body, _ := json.Marshal(map[string]string{
+func sendRequest(target, command string) (map[string]string, error) {
+	body, err := json.Marshal(map[string]string{
 		"command": command,
 	})
+	if err != nil {
+		return nil, err
+	}
 
-	resp, err := http.Post("http://"+target+"/client-request", "application/json", bytes.NewBuffer(body))
+	resp, err := http.Post(
+		"http://"+target+"/client-request",
+		"application/json",
+		bytes.NewBuffer(body),
+	)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf(
+			"node %s returned status %d",
+			target,
+			resp.StatusCode,
+		)
+	}
+
 	var result map[string]string
-	json.NewDecoder(resp.Body).Decode(&result)
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
 	return result, nil
 }
-func TestBasicReplication(t *testing.T) {
-	fmt.Println("Starting TestBasicReplication...")
 
-	node1 := startNode("node-1", "localhost:8001", "localhost:8002,localhost:8003")
-	node2 := startNode("node-2", "localhost:8002", "localhost:8001,localhost:8003")
-	node3 := startNode("node-3", "localhost:8003", "localhost:8001,localhost:8002")
+func getNodeStatus(target string) (map[string]interface{}, error) {
+	resp, err := http.Get("http://" + target + "/status")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func TestBasicReplication(t *testing.T) {
+	time.Sleep(2 * time.Second)
+	t.Log("Starting TestBasicReplication...")
+
+	node1, err := startNode(
+		"node-1",
+		"localhost:8001",
+		"localhost:8002,localhost:8003",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	node2, err := startNode(
+		"node-2",
+		"localhost:8002",
+		"localhost:8001,localhost:8003",
+	)
+	if err != nil {
+		killNode(node1)
+		t.Fatal(err)
+	}
+
+	node3, err := startNode(
+		"node-3",
+		"localhost:8003",
+		"localhost:8001,localhost:8002",
+	)
+	if err != nil {
+		killNode(node1)
+		killNode(node2)
+		t.Fatal(err)
+	}
 
 	defer killNode(node1)
 	defer killNode(node2)
 	defer killNode(node3)
 
-	fmt.Println("Waiting for leader election...")
+	t.Log("Waiting for leader election...")
 	time.Sleep(10 * time.Second)
 
 	result, err := sendToLeader("PUT name Mohamed")
@@ -75,57 +152,120 @@ func TestBasicReplication(t *testing.T) {
 		t.Fatalf("PUT request failed: %v", err)
 	}
 	if result["status"] != "ok" {
-		t.Fatalf("PUT failed: %v", result)
+		t.Fatalf("PUT failed: %+v", result)
 	}
 	fmt.Println("PUT succeeded")
 
 	time.Sleep(1 * time.Second)
 
-	for _, addr := range []string{"localhost:8001", "localhost:8002", "localhost:8003"} {
-		result, err := sendRequest(addr, "GET name")
+	for _, addr := range nodes {
+		status, err := getNodeStatus(addr)
 		if err != nil {
-			t.Errorf("GET from %s failed: %v", addr, err)
+			t.Errorf("failed to get status from %s: %v", addr, err)
 			continue
 		}
-		if result["value"] != "Mohamed" {
-			t.Errorf("Node %s has wrong value: %v", addr, result)
+		kvStore, ok := status["kv_store"].(map[string]interface{})
+		if !ok {
+			t.Errorf("node %s has no kvStore", addr)
+			continue
+		}
+		if kvStore["name"] != "Mohamed" {
+			t.Errorf("node %s expected Mohamed, got %v", addr, kvStore["name"])
 		} else {
-			fmt.Printf("Node %s correctly has value: Mohamed\n", addr)
+			fmt.Printf("node %s has correct value: Mohamed \n", addr)
 		}
 	}
 }
+
 func TestLeaderFailure(t *testing.T) {
-	fmt.Println("Starting TestLeaderFailure...")
-
-	node1 := startNode("node-1", "localhost:8001", "localhost:8002,localhost:8003")
-	node2 := startNode("node-2", "localhost:8002", "localhost:8001,localhost:8003")
-	node3 := startNode("node-3", "localhost:8003", "localhost:8001,localhost:8002")
-
-	defer killNode(node2)
-	defer killNode(node3)
-
-	fmt.Println("Waiting for leader election...")
 	time.Sleep(5 * time.Second)
+	t.Log("Starting TestLeaderFailure...")
+
+	node1, err := startNode(
+		"node-1",
+		"localhost:8001",
+		"localhost:8002,localhost:8003",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	node2, err := startNode(
+		"node-2",
+		"localhost:8002",
+		"localhost:8001,localhost:8003",
+	)
+	if err != nil {
+		killNode(node1)
+		t.Fatal(err)
+	}
+
+	node3, err := startNode(
+		"node-3",
+		"localhost:8003",
+		"localhost:8001,localhost:8002",
+	)
+	if err != nil {
+		killNode(node1)
+		killNode(node2)
+		t.Fatal(err)
+	}
+
+	nodeCmds := map[string]*exec.Cmd{
+		"localhost:8001": node1,
+		"localhost:8002": node2,
+		"localhost:8003": node3,
+	}
+
+	t.Log("Waiting for leader election...")
+	time.Sleep(10 * time.Second)
 
 	result, err := sendToLeader("PUT city Columbus")
 	if err != nil {
 		t.Fatalf("PUT request failed: %v", err)
 	}
 	if result["status"] != "ok" {
-		t.Fatalf("PUT failed: %v", result)
+		t.Fatalf("PUT failed: %+v", result)
 	}
-	fmt.Println("PUT succeeded, now killing node-1...")
+	fmt.Println("PUT succeeded")
 
-	killNode(node1)
-	fmt.Println("Node-1 killed, waiting for re-election...")
+	// find the actual leader
+	leaderAddr := ""
+	for _, addr := range nodes {
+		status, err := getNodeStatus(addr)
+		if err != nil {
+			continue
+		}
+		if status["role"] == "leader" {
+			leaderAddr = addr
+			break
+		}
+	}
+
+	if leaderAddr == "" {
+		t.Fatal("could not identify leader")
+	}
+
+	defer func() {
+		for addr, cmd := range nodeCmds {
+			if addr != leaderAddr {
+				killNode(cmd)
+			}
+		}
+	}()
+
+	fmt.Printf("Killing leader at %s...\n", leaderAddr)
+	killNode(nodeCmds[leaderAddr])
+
+	t.Log("Waiting for re-election...")
 	time.Sleep(10 * time.Second)
 
 	result, err = sendToLeader("GET city")
 	if err != nil {
-		t.Fatalf("GET failed after leader failure: %v", err)
+		t.Fatalf("GET failed: %v", err)
 	}
 	if result["value"] != "Columbus" {
-		t.Errorf("Data lost after leader failure: %v", result)
+		t.Fatalf("expected Columbus, got %+v", result)
 	} else {
 		fmt.Println("Data survived leader failure: Columbus ")
 	}

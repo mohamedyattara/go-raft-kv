@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>go-raft-kv Dashboard</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'Courier New', monospace;
+            background: #0d1117;
+            color: #c9d1d9;
+            padding: 24px;
+        }
+
+        h1 {
+            font-size: 20px;
+            color: #58a6ff;
+            margin-bottom: 4px;
+        }
+
+        .subtitle {
+            font-size: 12px;
+            color: #8b949e;
+            margin-bottom: 24px;
+        }
+
+        .cluster {
+            display: flex;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+
+        .node-card {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 20px;
+            width: 280px;
+        }
+
+        .node-card.leader {
+            border-color: #3fb950;
+        }
+
+        .node-card.candidate {
+            border-color: #d29922;
+        }
+
+        .node-card.offline {
+            border-color: #f85149;
+            opacity: 0.6;
+        }
+
+        .node-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+
+        .node-id {
+            font-size: 16px;
+            font-weight: bold;
+            color: #e6edf3;
+        }
+
+        .role-badge {
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 12px;
+            text-transform: uppercase;
+            font-weight: bold;
+        }
+
+        .role-badge.leader { background: #1a4721; color: #3fb950; }
+        .role-badge.follower { background: #1c2a3a; color: #58a6ff; }
+        .role-badge.candidate { background: #2d2000; color: #d29922; }
+        .role-badge.offline { background: #2d1214; color: #f85149; }
+
+        .stat {
+            display: flex;
+            justify-content: space-between;
+            font-size: 13px;
+            margin-bottom: 8px;
+            color: #8b949e;
+        }
+
+        .stat span:last-child {
+            color: #e6edf3;
+        }
+
+        .divider {
+            border: none;
+            border-top: 1px solid #30363d;
+            margin: 12px 0;
+        }
+
+        .kv-title {
+            font-size: 11px;
+            color: #8b949e;
+            text-transform: uppercase;
+            margin-bottom: 8px;
+        }
+
+        .kv-entry {
+            display: flex;
+            justify-content: space-between;
+            font-size: 12px;
+            margin-bottom: 4px;
+        }
+
+        .kv-key { color: #79c0ff; }
+        .kv-value { color: #a5d6ff; }
+
+        .kv-empty {
+            font-size: 12px;
+            color: #484f58;
+            font-style: italic;
+        }
+
+        .last-updated {
+            font-size: 11px;
+            color: #484f58;
+            margin-top: 24px;
+        }
+    </style>
+</head>
+<body>
+    <h1>go-raft-kv</h1>
+    <p class="subtitle">Distributed Key-Value Store — Live Cluster State</p>
+
+    <div class="cluster" id="cluster"></div>
+    <p class="last-updated" id="last-updated"></p>
+
+    <script>
+        const NODES = [
+            { id: 'node-1', address: 'localhost:8001' },
+            { id: 'node-2', address: 'localhost:8002' },
+            { id: 'node-3', address: 'localhost:8003' },
+        ];
+
+        async function fetchStatus(node) {
+            try {
+                const resp = await fetch(`http://${node.address}/status`);
+                if (!resp.ok) throw new Error('not ok');
+                return await resp.json();
+            } catch {
+                return null;
+            }
+        }
+
+        function renderNode(node, status) {
+            const role = status ? status.role : 'offline';
+            const card = document.createElement('div');
+            card.className = `node-card ${role}`;
+
+            const kvEntries = status && status.kv_store
+                ? Object.entries(status.kv_store)
+                : [];
+
+            card.innerHTML = `
+                <div class="node-header">
+                    <span class="node-id">${node.id}</span>
+                    <span class="role-badge ${role}">${role}</span>
+                </div>
+                <div class="stat">
+                    <span>Address</span>
+                    <span>${node.address}</span>
+                </div>
+                <div class="stat">
+                    <span>Term</span>
+                    <span>${status ? status.term : '—'}</span>
+                </div>
+                <div class="stat">
+                    <span>Commit Index</span>
+                    <span>${status ? status.commit_index : '—'}</span>
+                </div>
+                <div class="stat">
+                    <span>Log Length</span>
+                    <span>${status ? status.log_length : '—'}</span>
+                </div>
+                <hr class="divider">
+                <div class="kv-title">KV Store</div>
+                ${kvEntries.length > 0
+                    ? kvEntries.map(([k, v]) => `
+                        <div class="kv-entry">
+                            <span class="kv-key">${k}</span>
+                            <span class="kv-value">${v}</span>
+                        </div>`).join('')
+                    : '<div class="kv-empty">empty</div>'
+                }
+            `;
+
+            return card;
+        }
+
+        async function refresh() {
+            const statuses = await Promise.all(NODES.map(fetchStatus));
+            const cluster = document.getElementById('cluster');
+            cluster.innerHTML = '';
+            NODES.forEach((node, i) => {
+                cluster.appendChild(renderNode(node, statuses[i]));
+            });
+            document.getElementById('last-updated').textContent =
+                `Last updated: ${new Date().toLocaleTimeString()}`;
+        }
+
+        refresh();
+        setInterval(refresh, 1000);
+    </script>
+</body>
+</html>

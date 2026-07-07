@@ -92,6 +92,7 @@ func (n *Node) startHTTPServer() {
 	mux.HandleFunc("/append-entries", n.handleAppendEntries)
 	mux.HandleFunc("/client-request", n.handleClientRequest)
 	mux.HandleFunc("/status", n.handleStatus)
+	mux.HandleFunc("/", n.handleDashboard)
 	server := &http.Server{
 		Addr:    n.address,
 		Handler: mux,
@@ -123,6 +124,10 @@ type AppendEntriesRequest struct {
 type AppendEntriesResponse struct {
 	Term    int  `json:"term"`
 	Success bool `json:"success"`
+}
+
+func (n *Node) handleDashboard(w http.ResponseWriter, r *http.Request) {
+	http.ServeFile(w, r, "dashboard.html")
 }
 
 func (n *Node) handleRequestVote(w http.ResponseWriter, r *http.Request) {
