@@ -11,10 +11,49 @@ import (
 	"time"
 )
 
+var (
+	node1Cmd *exec.Cmd
+	node2Cmd *exec.Cmd
+	node3Cmd *exec.Cmd
+)
+
 var nodes = []string{
 	"localhost:8001",
 	"localhost:8002",
 	"localhost:8003",
+}
+
+func TestMain(m *testing.M) {
+	var err error
+
+	node1Cmd, err = startNode("node-1", "localhost:8001", "localhost:8002,localhost:8003")
+	if err != nil {
+		fmt.Printf("failed to start node-1: %v\n", err)
+		os.Exit(1)
+	}
+
+	node2Cmd, err = startNode("node-2", "localhost:8002", "localhost:8001,localhost:8003")
+	if err != nil {
+		fmt.Printf("failed to start node-2: %v\n", err)
+		os.Exit(1)
+	}
+
+	node3Cmd, err = startNode("node-3", "localhost:8003", "localhost:8001,localhost:8002")
+	if err != nil {
+		fmt.Printf("failed to start node-3: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("Waiting for cluster to stabilize...")
+	time.Sleep(10 * time.Second)
+
+	code := m.Run()
+
+	killNode(node1Cmd)
+	killNode(node2Cmd)
+	killNode(node3Cmd)
+
+	os.Exit(code)
 }
 
 func startNode(id, address, peers string) (*exec.Cmd, error) {
@@ -107,45 +146,7 @@ func getNodeStatus(target string) (map[string]interface{}, error) {
 }
 
 func TestBasicReplication(t *testing.T) {
-	time.Sleep(2 * time.Second)
 	t.Log("Starting TestBasicReplication...")
-
-	node1, err := startNode(
-		"node-1",
-		"localhost:8001",
-		"localhost:8002,localhost:8003",
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	node2, err := startNode(
-		"node-2",
-		"localhost:8002",
-		"localhost:8001,localhost:8003",
-	)
-	if err != nil {
-		killNode(node1)
-		t.Fatal(err)
-	}
-
-	node3, err := startNode(
-		"node-3",
-		"localhost:8003",
-		"localhost:8001,localhost:8002",
-	)
-	if err != nil {
-		killNode(node1)
-		killNode(node2)
-		t.Fatal(err)
-	}
-
-	defer killNode(node1)
-	defer killNode(node2)
-	defer killNode(node3)
-
-	t.Log("Waiting for leader election...")
-	time.Sleep(10 * time.Second)
 
 	result, err := sendToLeader("PUT name Mohamed")
 	if err != nil {
@@ -178,47 +179,7 @@ func TestBasicReplication(t *testing.T) {
 }
 
 func TestLeaderFailure(t *testing.T) {
-	time.Sleep(5 * time.Second)
 	t.Log("Starting TestLeaderFailure...")
-
-	node1, err := startNode(
-		"node-1",
-		"localhost:8001",
-		"localhost:8002,localhost:8003",
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	node2, err := startNode(
-		"node-2",
-		"localhost:8002",
-		"localhost:8001,localhost:8003",
-	)
-	if err != nil {
-		killNode(node1)
-		t.Fatal(err)
-	}
-
-	node3, err := startNode(
-		"node-3",
-		"localhost:8003",
-		"localhost:8001,localhost:8002",
-	)
-	if err != nil {
-		killNode(node1)
-		killNode(node2)
-		t.Fatal(err)
-	}
-
-	nodeCmds := map[string]*exec.Cmd{
-		"localhost:8001": node1,
-		"localhost:8002": node2,
-		"localhost:8003": node3,
-	}
-
-	t.Log("Waiting for leader election...")
-	time.Sleep(10 * time.Second)
 
 	result, err := sendToLeader("PUT city Columbus")
 	if err != nil {
@@ -246,16 +207,18 @@ func TestLeaderFailure(t *testing.T) {
 		t.Fatal("could not identify leader")
 	}
 
-	defer func() {
-		for addr, cmd := range nodeCmds {
-			if addr != leaderAddr {
-				killNode(cmd)
-			}
-		}
-	}()
-
 	fmt.Printf("Killing leader at %s...\n", leaderAddr)
-	killNode(nodeCmds[leaderAddr])
+	switch leaderAddr {
+	case "localhost:8001":
+		killNode(node1Cmd)
+		node1Cmd = nil
+	case "localhost:8002":
+		killNode(node2Cmd)
+		node2Cmd = nil
+	case "localhost:8003":
+		killNode(node3Cmd)
+		node3Cmd = nil
+	}
 
 	t.Log("Waiting for re-election...")
 	time.Sleep(10 * time.Second)

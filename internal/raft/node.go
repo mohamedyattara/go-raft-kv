@@ -93,9 +93,20 @@ func (n *Node) startHTTPServer() {
 	mux.HandleFunc("/client-request", n.handleClientRequest)
 	mux.HandleFunc("/status", n.handleStatus)
 	mux.HandleFunc("/", n.handleDashboard)
+
+	corsHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
 	server := &http.Server{
 		Addr:    n.address,
-		Handler: mux,
+		Handler: corsHandler,
 	}
 
 	fmt.Printf("Node %s listening on %s\n", n.id, n.address)
@@ -299,6 +310,8 @@ func (n *Node) handleClientRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 func (n *Node) handleStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Content-Type", "application/json")
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
