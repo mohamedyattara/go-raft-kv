@@ -233,3 +233,191 @@ func TestLeaderFailure(t *testing.T) {
 		fmt.Println("Data survived leader failure: Columbus ")
 	}
 }
+func TestFollowerFailure(t *testing.T) {
+	t.Log("Starting TestFollowerFailure...")
+
+	// find a follower
+	followerAddr := ""
+	for _, addr := range nodes {
+		status, err := getNodeStatus(addr)
+		if err != nil {
+			continue
+		}
+		if status["role"] == "follower" {
+			followerAddr = addr
+			break
+		}
+	}
+
+	if followerAddr == "" {
+		t.Fatal("could not identify a follower")
+	}
+
+	fmt.Printf("Killing follower at %s...\n", followerAddr)
+	switch followerAddr {
+	case "localhost:8001":
+		killNode(node1Cmd)
+		node1Cmd = nil
+	case "localhost:8002":
+		killNode(node2Cmd)
+		node2Cmd = nil
+	case "localhost:8003":
+		killNode(node3Cmd)
+		node3Cmd = nil
+	}
+
+	// cluster should still work with 2 nodes
+	result, err := sendToLeader("PUT country Guinea")
+	if err != nil {
+		t.Fatalf("PUT failed after follower death: %v", err)
+	}
+	if result["status"] != "ok" {
+		t.Fatalf("PUT failed: %+v", result)
+	}
+	fmt.Println("Cluster still working with one follower down ")
+
+	// restart the dead follower
+	var startErr error
+	switch followerAddr {
+	case "localhost:8001":
+		node1Cmd, startErr = startNode("node-1", "localhost:8001", "localhost:8002,localhost:8003")
+	case "localhost:8002":
+		node2Cmd, startErr = startNode("node-2", "localhost:8002", "localhost:8001,localhost:8003")
+	case "localhost:8003":
+		node3Cmd, startErr = startNode("node-3", "localhost:8003", "localhost:8001,localhost:8002")
+	}
+
+	if startErr != nil {
+		t.Fatalf("failed to restart follower: %v", startErr)
+	}
+
+	fmt.Println("Waiting for follower to catch up...")
+	time.Sleep(15 * time.Second)
+
+	// verify restarted follower has the data
+	status, err := getNodeStatus(followerAddr)
+	if err != nil {
+		t.Fatalf("failed to get status from restarted follower: %v", err)
+	}
+
+	kvStore, ok := status["kv_store"].(map[string]interface{})
+	if !ok {
+		t.Fatal("restarted follower has no kvStore")
+	}
+
+	if kvStore["country"] != "Guinea" {
+		t.Errorf("restarted follower missing data, got: %v", kvStore)
+	} else {
+		fmt.Println("Restarted follower caught up correctly ")
+	}
+}
+func TestMultiplePuts(t *testing.T) {
+	t.Log("Starting TestMultiplePuts...")
+
+	keys := []string{"k1", "k2", "k3", "k4", "k5", "k6", "k7", "k8", "k9", "k10"}
+	values := []string{"v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10"}
+
+	for i, key := range keys {
+		result, err := sendToLeader(fmt.Sprintf("PUT %s %s", key, values[i]))
+		if err != nil {
+			t.Fatalf("PUT %s failed: %v", key, err)
+		}
+		if result["status"] != "ok" {
+			t.Fatalf("PUT %s failed: %+v", key, result)
+		}
+	}
+	fmt.Println("All 10 PUTs succeeded")
+
+	time.Sleep(1 * time.Second)
+
+	for i, key := range keys {
+		result, err := sendToLeader(fmt.Sprintf("GET %s", key))
+		if err != nil {
+			t.Errorf("GET %s failed: %v", key, err)
+			continue
+		}
+		if result["value"] != values[i] {
+			t.Errorf("key %s expected %s got %v", key, values[i], result)
+		} else {
+			fmt.Printf("key %s = %s \n", key, values[i])
+		}
+	}
+}
+func TestLeaderFailureDuringWrite(t *testing.T) {
+	t.Log("Starting TestLeaderFailureDuringWrite...")
+
+	// find the current leader
+	leaderAddr := ""
+	for _, addr := range nodes {
+		status, err := getNodeStatus(addr)
+		if err != nil {
+			continue
+		}
+		if status["role"] == "leader" {
+			leaderAddr = addr
+			break
+		}
+	}
+
+	if leaderAddr == "" {
+		t.Fatal("could not identify leader")
+	}
+
+	fmt.Printf("Current leader: %s\n", leaderAddr)
+
+	// send a write and kill the leader simultaneously
+	writeDone := make(chan map[string]string, 1)
+	go func() {
+		result, err := sendToLeader("PUT critical value123")
+		if err != nil {
+			writeDone <- map[string]string{"error": err.Error()}
+			return
+		}
+		writeDone <- result
+	}()
+
+	// kill leader almost immediately
+	time.Sleep(10 * time.Millisecond)
+	switch leaderAddr {
+	case "localhost:8001":
+		killNode(node1Cmd)
+		node1Cmd = nil
+	case "localhost:8002":
+		killNode(node2Cmd)
+		node2Cmd = nil
+	case "localhost:8003":
+		killNode(node3Cmd)
+		node3Cmd = nil
+	}
+
+	// get write result
+	writeResult := <-writeDone
+	fmt.Printf("Write result: %v\n", writeResult)
+
+	// wait for re-election
+	fmt.Println("Waiting for re-election...")
+	time.Sleep(10 * time.Second)
+
+	// check cluster state — data should either be committed on all nodes
+	// or absent on all nodes. never partial.
+	result, err := sendToLeader("GET critical")
+	if err != nil {
+		t.Fatalf("GET failed after leader failure: %v", err)
+	}
+
+	if writeResult["status"] == "ok" {
+		// write was confirmed — data must exist
+		if result["value"] != "value123" {
+			t.Errorf("write was confirmed but data lost: %v", result)
+		} else {
+			fmt.Println("Write committed and survived leader failure ✅")
+		}
+	} else {
+		// write was not confirmed — data must not exist
+		if result["value"] == "value123" {
+			t.Errorf("write was not confirmed but data exists — corruption detected ❌")
+		} else {
+			fmt.Println("Write correctly rejected, no corruption ✅")
+		}
+	}
+}

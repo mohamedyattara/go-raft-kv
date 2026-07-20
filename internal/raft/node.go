@@ -234,7 +234,7 @@ func (n *Node) handleRequestVote(w http.ResponseWriter, r *http.Request) {
 	}
 	resp.Term = n.currentTerm
 
-	myLastIndex, myLastTerm := n.lastLogIndexAndTerm() // however you expose this
+	myLastIndex, myLastTerm := n.lastLogIndexAndTerm()
 	candidateUpToDate := req.LastLogTerm > myLastTerm ||
 		(req.LastLogTerm == myLastTerm && req.LastLogIndex >= myLastIndex)
 
@@ -291,7 +291,7 @@ func (n *Node) handleAppendEntries(w http.ResponseWriter, r *http.Request) {
 
 	if req.PrevLogIndex >= 0 {
 		if req.PrevLogIndex >= len(n.log) {
-			// we don't even have an entry at PrevLogIndex
+
 			resp.LastLogIndex = len(n.log) - 1
 			json.NewEncoder(w).Encode(resp)
 			return
