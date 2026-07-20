@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -58,9 +59,14 @@ type LogEntry struct {
 	Term    int
 	Command string
 }
+type PersistentState struct {
+	CurrentTerm int        `json:"current_term"`
+	VotedFor    string     `json:"voted_for"`
+	Log         []LogEntry `json:"log"`
+}
 
 func NewNode(id string, address string, peers []string) *Node {
-	return &Node{
+	n := &Node{
 		id:               id,
 		address:          address,
 		peers:            peers,
@@ -76,9 +82,11 @@ func NewNode(id string, address string, peers []string) *Node {
 		heartbeatCh:      make(chan bool, 1),
 		voteCh:           make(chan bool, 1),
 		stepDownCh:       make(chan bool, 1),
-		electionTimeout:  time.Duration(3000+rand.Intn(1500)) * time.Millisecond,
-		heartbeatTimeout: 50 * time.Millisecond,
+		electionTimeout:  time.Duration(150+rand.Intn(150)) * time.Millisecond,
+		heartbeatTimeout: 20 * time.Millisecond,
 	}
+	n.loadState()
+	return n
 
 }
 
@@ -115,6 +123,60 @@ func (n *Node) startHTTPServer() {
 	if err := server.ListenAndServe(); err != nil {
 		fmt.Printf("Node %s HTTP server error: %s\n", n.id, err)
 	}
+}
+
+func (n *Node) persist() {
+	state := PersistentState{
+		CurrentTerm: n.currentTerm,
+		VotedFor:    n.votedFor,
+		Log:         n.log,
+	}
+
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		fmt.Printf("Node %s: FATAL failed to marshal persistent state: %s\n", n.id, err)
+		return
+	}
+
+	filename := n.id + ".state.json"
+	tmpFilename := filename + ".tmp"
+
+	if err := os.WriteFile(tmpFilename, data, 0644); err != nil {
+		fmt.Printf("Node %s: FATAL failed to write persistent state: %s\n", n.id, err)
+		return
+	}
+
+	if err := os.Rename(tmpFilename, filename); err != nil {
+		fmt.Printf("Node %s: FATAL failed to commit persistent state: %s\n", n.id, err)
+		return
+	}
+}
+
+func (n *Node) loadState() {
+	filename := n.id + ".state.json"
+
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Printf("Node %s: no persisted state found, starting fresh\n", n.id)
+			return
+		}
+		fmt.Printf("Node %s: FATAL failed to read persistent state: %s\n", n.id, err)
+		return
+	}
+
+	var state PersistentState
+	if err := json.Unmarshal(data, &state); err != nil {
+		fmt.Printf("Node %s: FATAL failed to parse persistent state: %s\n", n.id, err)
+		return
+	}
+
+	n.currentTerm = state.CurrentTerm
+	n.votedFor = state.VotedFor
+	n.log = state.Log
+
+	fmt.Printf("Node %s: restored state - term=%d votedFor=%s logLen=%d\n",
+		n.id, n.currentTerm, n.votedFor, len(n.log))
 }
 
 type VoteRequest struct {
@@ -168,6 +230,7 @@ func (n *Node) handleRequestVote(w http.ResponseWriter, r *http.Request) {
 		n.currentTerm = req.Term
 		n.role = "follower"
 		n.votedFor = ""
+		n.persist()
 	}
 	resp.Term = n.currentTerm
 
@@ -177,6 +240,7 @@ func (n *Node) handleRequestVote(w http.ResponseWriter, r *http.Request) {
 
 	if (n.votedFor == "" || n.votedFor == req.CandidateID) && candidateUpToDate {
 		n.votedFor = req.CandidateID
+		n.persist()
 		resp.VoteGranted = true
 		select {
 		case n.heartbeatCh <- true:
@@ -212,6 +276,7 @@ func (n *Node) handleAppendEntries(w http.ResponseWriter, r *http.Request) {
 	if req.Term > n.currentTerm {
 		n.currentTerm = req.Term
 		n.votedFor = ""
+		n.persist()
 
 	}
 
@@ -247,11 +312,13 @@ func (n *Node) handleAppendEntries(w http.ResponseWriter, r *http.Request) {
 					// conflict: truncate here and start appending fresh
 					n.log = n.log[:idx]
 					n.log = append(n.log, req.Entries[i:]...)
+					n.persist()
 					break
 				}
 				// else: identical entry already present, skip
 			} else {
 				n.log = append(n.log, req.Entries[i:]...)
+				n.persist()
 				break
 			}
 		}
@@ -372,7 +439,7 @@ func (n *Node) applyEntries() {
 }
 func (n *Node) resetElectionTimeout() {
 	n.electionTimeout =
-		time.Duration(3000+rand.Intn(1500)) * time.Millisecond
+		time.Duration(150+rand.Intn(150)) * time.Millisecond
 }
 func (n *Node) runElectionTimer() {
 	for {
@@ -400,6 +467,7 @@ func (n *Node) startElection() {
 	n.leaderID = ""
 	n.currentTerm++
 	n.votedFor = n.id
+	n.persist()
 	votes := 1
 	term := n.currentTerm
 	n.mu.Unlock()
@@ -437,6 +505,7 @@ func (n *Node) startElection() {
 				n.currentTerm = resp.Term
 				n.role = "follower"
 				n.votedFor = ""
+				n.persist()
 				return
 			}
 
@@ -447,6 +516,7 @@ func (n *Node) startElection() {
 					n.role = "leader"
 					fmt.Printf("Node %s became leader for term %d\n", n.id, term)
 					n.resetLeaderState()
+					n.persist()
 					go n.runHeartbeatSender()
 				}
 			}
@@ -517,6 +587,7 @@ func (n *Node) runHeartbeatSender() {
 					n.currentTerm = resp.Term
 					n.role = "follower"
 					n.votedFor = ""
+					n.persist()
 					return
 				}
 

@@ -2,4 +2,7 @@
 *.test
 *.out
 .DS_Store
-/bin/
+/bin/*.state.json 
+raft-node.exe~ 
+*.exe 
+*.state.json 
