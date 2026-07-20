@@ -13,9 +13,10 @@ import (
 
 type Node struct {
 	// identity
-	id      string
-	address string
-	peers   []string
+	id       string
+	address  string
+	peers    []string
+	leaderID string
 
 	// raft state
 	role        string
@@ -49,6 +50,7 @@ type NodeStatus struct {
 	Role        string            `json:"role"`
 	Term        int               `json:"term"`
 	CommitIndex int               `json:"commit_index"`
+	LastApplied int               `json:"last_applied"`
 	LogLength   int               `json:"log_length"`
 	KVStore     map[string]string `json:"kv_store"`
 }
@@ -116,8 +118,10 @@ func (n *Node) startHTTPServer() {
 }
 
 type VoteRequest struct {
-	Term        int    `json:"term"`
-	CandidateID string `json:"candidate_id"`
+	Term         int    `json:"term"`
+	CandidateID  string `json:"candidate_id"`
+	LastLogIndex int    `json:"last_log_index"`
+	LastLogTerm  int    `json:"last_log_term"`
 }
 
 type VoteResponse struct {
@@ -130,11 +134,14 @@ type AppendEntriesRequest struct {
 	LeaderID     string     `json:"leader_id"`
 	Entries      []LogEntry `json:"entries"`
 	LeaderCommit int        `json:"leader_commit"`
+	PrevLogIndex int        `json:"prev_log_index"`
+	PrevLogTerm  int        `json:"prev_log_term"`
 }
 
 type AppendEntriesResponse struct {
-	Term    int  `json:"term"`
-	Success bool `json:"success"`
+	Term         int  `json:"term"`
+	Success      bool `json:"success"`
+	LastLogIndex int  `json:"last_log_index"`
 }
 
 func (n *Node) handleDashboard(w http.ResponseWriter, r *http.Request) {
@@ -143,20 +150,32 @@ func (n *Node) handleDashboard(w http.ResponseWriter, r *http.Request) {
 
 func (n *Node) handleRequestVote(w http.ResponseWriter, r *http.Request) {
 	var req VoteRequest
-	json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request body", http.StatusBadRequest)
+		return
+	}
 
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
 	resp := VoteResponse{Term: n.currentTerm, VoteGranted: false}
 
+	if req.Term < n.currentTerm {
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
 	if req.Term > n.currentTerm {
 		n.currentTerm = req.Term
 		n.role = "follower"
 		n.votedFor = ""
 	}
+	resp.Term = n.currentTerm
 
-	if req.Term >= n.currentTerm && (n.votedFor == "" || n.votedFor == req.CandidateID) {
+	myLastIndex, myLastTerm := n.lastLogIndexAndTerm() // however you expose this
+	candidateUpToDate := req.LastLogTerm > myLastTerm ||
+		(req.LastLogTerm == myLastTerm && req.LastLogIndex >= myLastIndex)
+
+	if (n.votedFor == "" || n.votedFor == req.CandidateID) && candidateUpToDate {
 		n.votedFor = req.CandidateID
 		resp.VoteGranted = true
 		select {
@@ -167,15 +186,24 @@ func (n *Node) handleRequestVote(w http.ResponseWriter, r *http.Request) {
 
 	json.NewEncoder(w).Encode(resp)
 }
+func (n *Node) lastLogIndexAndTerm() (int, int) {
+	if len(n.log) == 0 {
+		return 0, 0
+	}
+	lastIdx := len(n.log) - 1
+	return lastIdx, n.log[lastIdx].Term
+}
+
 func (n *Node) handleAppendEntries(w http.ResponseWriter, r *http.Request) {
 	var req AppendEntriesRequest
-	json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request body", http.StatusBadRequest)
+		return
+	}
 
 	n.mu.Lock()
 	defer n.mu.Unlock()
-
-	resp := AppendEntriesResponse{Term: n.currentTerm, Success: false}
-
+	resp := AppendEntriesResponse{Term: n.currentTerm, Success: false, LastLogIndex: len(n.log) - 1}
 	if req.Term < n.currentTerm {
 		json.NewEncoder(w).Encode(resp)
 		return
@@ -184,26 +212,64 @@ func (n *Node) handleAppendEntries(w http.ResponseWriter, r *http.Request) {
 	if req.Term > n.currentTerm {
 		n.currentTerm = req.Term
 		n.votedFor = ""
+
 	}
 
 	n.role = "follower"
+	n.leaderID = req.LeaderID
 	//fmt.Printf("Node %s received heartbeat from %s term %d\n", n.id, req.LeaderID, req.Term)
 	select {
 	case n.heartbeatCh <- true:
 	default:
 	}
+	resp.Term = n.currentTerm
 
+	if req.PrevLogIndex >= 0 {
+		if req.PrevLogIndex >= len(n.log) {
+			// we don't even have an entry at PrevLogIndex
+			resp.LastLogIndex = len(n.log) - 1
+			json.NewEncoder(w).Encode(resp)
+			return
+		}
+		if n.log[req.PrevLogIndex].Term != req.PrevLogTerm {
+			// entry exists but term mismatch -- conflict
+			resp.LastLogIndex = len(n.log) - 1
+			json.NewEncoder(w).Encode(resp)
+			return
+		}
+	}
 	if len(req.Entries) > 0 {
-		n.log = append(n.log, req.Entries...)
+		insertAt := req.PrevLogIndex + 1
+		for i, entry := range req.Entries {
+			idx := insertAt + i
+			if idx < len(n.log) {
+				if n.log[idx].Term != entry.Term {
+					// conflict: truncate here and start appending fresh
+					n.log = n.log[:idx]
+					n.log = append(n.log, req.Entries[i:]...)
+					break
+				}
+				// else: identical entry already present, skip
+			} else {
+				n.log = append(n.log, req.Entries[i:]...)
+				break
+			}
+		}
 	}
 
 	if req.LeaderCommit > n.commitIndex {
-		n.commitIndex = req.LeaderCommit
+		lastNewIndex := len(n.log) - 1
+		if req.LeaderCommit < lastNewIndex {
+			n.commitIndex = req.LeaderCommit
+		} else {
+			n.commitIndex = lastNewIndex
+		}
 		n.applyEntries()
 		fmt.Printf("Node %s applied entries up to index %d\n", n.id, n.commitIndex)
 	}
 
 	resp.Success = true
+	resp.LastLogIndex = len(n.log) - 1
 	json.NewEncoder(w).Encode(resp)
 }
 func (n *Node) handleClientRequest(w http.ResponseWriter, r *http.Request) {
@@ -216,13 +282,15 @@ func (n *Node) handleClientRequest(w http.ResponseWriter, r *http.Request) {
 		n.mu.Unlock()
 		json.NewEncoder(w).Encode(map[string]string{
 			"error":  "not_leader",
-			"leader": n.votedFor,
+			"leader": n.leaderID,
 		})
 		return
 	}
 
 	command := req["command"]
 	parts := strings.Split(command, " ")
+
+	// handle GET directly
 	if parts[0] == "GET" && len(parts) == 2 {
 		value, ok := n.kvStore[parts[1]]
 		n.mu.Unlock()
@@ -237,75 +305,34 @@ func (n *Node) handleClientRequest(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+
+	// append to leader log
 	entry := LogEntry{
 		Term:    n.currentTerm,
 		Command: command,
 	}
 	n.log = append(n.log, entry)
 	logIndex := len(n.log) - 1
-	term := n.currentTerm
 	n.mu.Unlock()
 
-	confirmed := 1
-	var mu sync.Mutex
-	confirmCh := make(chan bool, len(n.peers))
-
-	for _, peer := range n.peers {
-		go func(peer string) {
-			n.mu.Lock()
-			req := AppendEntriesRequest{
-				Term:         term,
-				LeaderID:     n.id,
-				Entries:      []LogEntry{entry},
-				LeaderCommit: n.commitIndex,
-			}
-			n.mu.Unlock()
-			resp, err := n.sendAppendEntries(peer, req)
-			if err != nil {
-				confirmCh <- false
-				return
-			}
-			if resp.Success {
-				n.mu.Lock()
-				n.matchIndex[peer] = logIndex
-				n.nextIndex[peer] = logIndex + 1
-				n.mu.Unlock()
-				confirmCh <- true
-			} else {
-				confirmCh <- false
-			}
-		}(peer)
-	}
-
-	for i := 0; i < len(n.peers); i++ {
-		if <-confirmCh {
-			mu.Lock()
-			confirmed++
-			mu.Unlock()
-		}
-	}
-	mu.Lock()
-	totalNodes := len(n.peers) + 1
-	majority := totalNodes/2 + 1
-	currentConfirmed := confirmed
-	mu.Unlock()
-
-	if currentConfirmed >= majority {
+	// wait for this entry to be committed
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
 		n.mu.Lock()
-		if logIndex > n.commitIndex {
-			n.commitIndex = logIndex
-			n.applyEntries()
+		if n.commitIndex >= logIndex {
+			n.mu.Unlock()
+			fmt.Printf("Node %s committed entry %d: %s\n", n.id, logIndex, command)
+			json.NewEncoder(w).Encode(map[string]string{
+				"status": "ok",
+			})
+			return
 		}
 		n.mu.Unlock()
-
-		fmt.Printf("Node %s committed entry %d: %s\n", n.id, logIndex, command)
-		json.NewEncoder(w).Encode(map[string]string{
-			"status": "ok",
-		})
-		return
+		time.Sleep(10 * time.Millisecond)
 	}
+
 	json.NewEncoder(w).Encode(map[string]string{
-		"error": "failed to replicate to majority",
+		"error": "failed to commit entry",
 	})
 }
 
@@ -321,6 +348,7 @@ func (n *Node) handleStatus(w http.ResponseWriter, r *http.Request) {
 		Term:        n.currentTerm,
 		CommitIndex: n.commitIndex,
 		LogLength:   len(n.log),
+		LastApplied: n.lastApplied,
 		KVStore:     n.kvStore,
 	}
 
@@ -329,7 +357,11 @@ func (n *Node) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 func (n *Node) applyEntries() {
 	for n.lastApplied < n.commitIndex {
-		n.lastApplied++
+		tentry := n.lastApplied + 1
+		if tentry >= len(n.log) {
+			break
+		}
+		n.lastApplied = tentry
 		entry := n.log[n.lastApplied]
 		parts := strings.Split(entry.Command, " ")
 
@@ -338,8 +370,13 @@ func (n *Node) applyEntries() {
 		}
 	}
 }
+func (n *Node) resetElectionTimeout() {
+	n.electionTimeout =
+		time.Duration(3000+rand.Intn(1500)) * time.Millisecond
+}
 func (n *Node) runElectionTimer() {
 	for {
+		n.resetElectionTimeout()
 		timeout := time.NewTimer(n.electionTimeout)
 
 		select {
@@ -359,6 +396,8 @@ func (n *Node) runElectionTimer() {
 func (n *Node) startElection() {
 	n.mu.Lock()
 	n.role = "candidate"
+	lastIndex, lastTerm := n.lastLogIndexAndTerm()
+	n.leaderID = ""
 	n.currentTerm++
 	n.votedFor = n.id
 	votes := 1
@@ -370,6 +409,7 @@ func (n *Node) startElection() {
 	if len(n.peers) == 0 {
 		n.mu.Lock()
 		n.role = "leader"
+		n.resetLeaderState()
 		n.mu.Unlock()
 		fmt.Printf("Node %s became leader for term %d (single node)\n", n.id, term)
 		go n.runHeartbeatSender()
@@ -378,8 +418,10 @@ func (n *Node) startElection() {
 	for _, peer := range n.peers {
 		go func(peer string) {
 			req := VoteRequest{
-				Term:        term,
-				CandidateID: n.id,
+				Term:         term,
+				CandidateID:  n.id,
+				LastLogIndex: lastIndex,
+				LastLogTerm:  lastTerm,
 			}
 			resp, err := n.sendVoteRequest(peer, req)
 			if err != nil {
@@ -387,6 +429,9 @@ func (n *Node) startElection() {
 			}
 			n.mu.Lock()
 			defer n.mu.Unlock()
+			if term != n.currentTerm || n.role != "candidate" {
+				return
+			}
 
 			if resp.Term > n.currentTerm {
 				n.currentTerm = resp.Term
@@ -394,16 +439,24 @@ func (n *Node) startElection() {
 				n.votedFor = ""
 				return
 			}
+
 			if resp.VoteGranted {
 				votes++
 				var totalNodes int = len(n.peers) + 1
 				if votes > totalNodes/2 && n.role != "leader" {
 					n.role = "leader"
 					fmt.Printf("Node %s became leader for term %d\n", n.id, term)
+					n.resetLeaderState()
 					go n.runHeartbeatSender()
 				}
 			}
 		}(peer)
+	}
+}
+func (n *Node) resetLeaderState() {
+	for _, peer := range n.peers {
+		n.nextIndex[peer] = len(n.log)
+		n.matchIndex[peer] = -1
 	}
 }
 func (n *Node) sendVoteRequest(peer string, req VoteRequest) (VoteResponse, error) {
@@ -429,21 +482,83 @@ func (n *Node) runHeartbeatSender() {
 			n.mu.Unlock()
 			return
 		}
-		n.mu.Unlock()
 
 		for _, peer := range n.peers {
-			go func(peer string) {
-				req := AppendEntriesRequest{
-					Term:         n.currentTerm,
-					LeaderID:     n.id,
-					Entries:      []LogEntry{},
-					LeaderCommit: n.commitIndex,
+			nextIdx := n.nextIndex[peer]
+			entries := []LogEntry{}
+			if nextIdx < len(n.log) {
+				entries = n.log[nextIdx:]
+			}
+
+			prevLogIndex := nextIdx - 1
+			prevLogTerm := 0
+			if prevLogIndex >= 0 && prevLogIndex < len(n.log) {
+				prevLogTerm = n.log[prevLogIndex].Term
+			}
+			req := AppendEntriesRequest{
+				Term:         n.currentTerm,
+				LeaderID:     n.id,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				Entries:      entries,
+				LeaderCommit: n.commitIndex,
+			}
+
+			go func(peer string, req AppendEntriesRequest, nextIdx int) {
+				resp, err := n.sendAppendEntries(peer, req)
+				if err != nil {
+					return
 				}
-				n.sendAppendEntries(peer, req)
-			}(peer)
+
+				n.mu.Lock()
+				defer n.mu.Unlock()
+
+				if resp.Term > n.currentTerm {
+					n.currentTerm = resp.Term
+					n.role = "follower"
+					n.votedFor = ""
+					return
+				}
+
+				if resp.Success {
+					if len(req.Entries) > 0 {
+						n.nextIndex[peer] = nextIdx + len(req.Entries)
+						n.matchIndex[peer] = n.nextIndex[peer] - 1
+					}
+					n.tryCommit()
+				} else {
+					n.nextIndex[peer] = resp.LastLogIndex + 1
+					if n.nextIndex[peer] < 0 {
+						n.nextIndex[peer] = 0
+					}
+				}
+			}(peer, req, nextIdx)
 		}
 
+		n.mu.Unlock()
 		time.Sleep(n.heartbeatTimeout)
+	}
+}
+func (n *Node) tryCommit() {
+	for idx := len(n.log) - 1; idx > n.commitIndex; idx-- {
+		if n.log[idx].Term != n.currentTerm {
+			continue
+		}
+
+		replicated := 1
+		for _, peer := range n.peers {
+			if n.matchIndex[peer] >= idx {
+				replicated++
+			}
+		}
+
+		totalNodes := len(n.peers) + 1
+		if replicated > totalNodes/2 {
+			n.commitIndex = idx
+			n.applyEntries()
+			fmt.Printf("Node %s committed index %d\n", n.id, idx)
+			break
+		}
 	}
 }
 func (n *Node) sendAppendEntries(peer string, req AppendEntriesRequest) (AppendEntriesResponse, error) {
